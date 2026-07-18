@@ -98,7 +98,7 @@ async function discord(channel: Channel, origin: string, stream: Awaited<ReturnT
   const mention = channel.role_id ? { parse: [], roles: [channel.role_id] } : { parse: [] };
   if (channel.banner_key) {
     await fetch(target, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
-      content: role, allowed_mentions: mention, embeds: [{ image: { url: `${origin}/assets/${encodeURIComponent(channel.banner_key)}` }, color: channel.color }]
+      allowed_mentions: { parse: [] }, embeds: [{ image: { url: `${origin}/assets/${encodeURIComponent(channel.banner_key)}` }, color: channel.color }]
     }) });
   }
   const title = stream?.title ?? (test ? "To jest wiadomość testowa" : "Stream trwa");
@@ -107,7 +107,7 @@ async function discord(channel: Channel, origin: string, stream: Awaited<ReturnT
   const thumbnail = stream?.thumbnail_url.replace("{width}", "1280").replace("{height}", "720");
   const login = stream?.user_login ?? channel.twitch_login;
   const payload = {
-    allowed_mentions: { parse: [] },
+    content: role, allowed_mentions: mention,
     embeds: [{
       author: { name: stream?.user_name ?? (channel.display_name || channel.twitch_login) }, title,
       url: `https://www.twitch.tv/${login}`, description: channel.message_text,
