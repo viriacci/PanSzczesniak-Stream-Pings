@@ -1,10 +1,23 @@
 interface Env {
   DB: D1Database;
   ADMIN_PASSWORD: string;
+  PASSWORD_SHIROE: string;
+  PASSWORD_VIVI: string;
   SESSION_SECRET: string;
   TWITCH_CLIENT_ID: string;
   TWITCH_CLIENT_SECRET: string;
   TWITCH_EVENTSUB_SECRET: string;
+}
+
+type AccountId = "panszczesniak" | "shiroe" | "vivi";
+type Account = { id: AccountId; label: string; channels: "all" | string[] };
+const ACCOUNTS: Record<AccountId, { label: string; passwordEnv: "ADMIN_PASSWORD" | "PASSWORD_SHIROE" | "PASSWORD_VIVI"; channels: "all" | string[] }> = {
+  panszczesniak: { label: "PanSzczesniak (admin)", passwordEnv: "ADMIN_PASSWORD", channels: "all" },
+  shiroe: { label: "Shiroe_com", passwordEnv: "PASSWORD_SHIROE", channels: ["shiroe_com"] },
+  vivi: { label: "ViviOnyx", passwordEnv: "PASSWORD_VIVI", channels: ["vivionyxx"] }
+};
+function canAccess(account: Account, login: string) {
+  return account.channels === "all" || account.channels.includes(login);
 }
 
 type Channel = {
@@ -24,15 +37,24 @@ async function sha256(value: string) {
 function cookie(request: Request, name: string) {
   return request.headers.get("Cookie")?.split(";").map(x => x.trim()).find(x => x.startsWith(name + "="))?.slice(name.length + 1);
 }
-async function isAdmin(request: Request, env: Env) {
+async function getAccount(request: Request, env: Env): Promise<Account | null> {
   const value = cookie(request, "stream_pings_session");
-  return value === await sha256("admin:" + env.SESSION_SECRET);
+  if (!value) return null;
+  const dot = value.indexOf(".");
+  if (dot < 0) return null;
+  const id = value.slice(0, dot) as AccountId;
+  const hash = value.slice(dot + 1);
+  const config = ACCOUNTS[id];
+  if (!config) return null;
+  if (!same(hash, await sha256(id + ":" + env.SESSION_SECRET))) return null;
+  return { id, label: config.label, channels: config.channels };
 }
 function html(body: string, status = 200, headers: HeadersInit = {}) {
   return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", ...headers } });
 }
 function loginPage(error = "") {
-  return `<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stream Pings</title><style>${styles}</style><main class="login"><h1>Stream Pings</h1><p>Panel administracyjny</p>${error ? `<p class="error">${error}</p>` : ""}<form method="post" action="/login"><label>Hasło administratora<input required type="password" name="password" autofocus></label><button>Zaloguj się</button></form></main></html>`;
+  const options = Object.entries(ACCOUNTS).map(([id, a]) => `<option value="${id}">${a.label}</option>`).join("");
+  return `<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stream Pings</title><style>${styles}</style><main class="login"><h1>Stream Pings</h1><p>Panel administracyjny</p>${error ? `<p class="error">${error}</p>` : ""}<form method="post" action="/login"><label>Konto<select name="login">${options}</select></label><label>Hasło<input required type="password" name="password" autofocus></label><button>Zaloguj się</button></form></main></html>`;
 }
 
 async function twitchToken(env: Env) {
@@ -100,8 +122,9 @@ async function discord(channel: Channel, origin: string, stream: Awaited<ReturnT
 }
 
 async function adminApp(request: Request, env: Env) {
-  if (!await isAdmin(request, env)) return new Response(null, { status: 302, headers: { Location: "/login" } });
-  return html(adminPage);
+  const account = await getAccount(request, env);
+  if (!account) return new Response(null, { status: 302, headers: { Location: "/login" } });
+  return html(adminPage(account));
 }
 
 export default {
@@ -115,15 +138,24 @@ export default {
     if (url.pathname === "/login" && request.method === "GET") return html(loginPage());
     if (url.pathname === "/login" && request.method === "POST") {
       const form = await request.formData();
-      if (form.get("password") !== env.ADMIN_PASSWORD) return html(loginPage("Nieprawidłowe hasło."), 401);
-      return new Response(null, { status: 302, headers: { Location: "/admin", "Set-Cookie": `stream_pings_session=${await sha256("admin:" + env.SESSION_SECRET)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000` } });
+      const id = String(form.get("login") ?? "") as AccountId;
+      const config = ACCOUNTS[id];
+      const password = String(form.get("password") ?? "");
+      if (!config || !same(password, env[config.passwordEnv] ?? "")) return html(loginPage("Nieprawidłowe konto lub hasło."), 401);
+      return new Response(null, { status: 302, headers: { Location: "/admin", "Set-Cookie": `stream_pings_session=${id}.${await sha256(id + ":" + env.SESSION_SECRET)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000` } });
     }
     if (url.pathname === "/logout") return new Response(null, { status: 302, headers: { Location: "/login", "Set-Cookie": "stream_pings_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
     if (url.pathname === "/" || url.pathname === "/admin") return adminApp(request, env);
     if (!url.pathname.startsWith("/api/")) return new Response("Nie znaleziono", { status: 404 });
-    if (!await isAdmin(request, env)) return json({ error: "Brak dostępu" }, 401);
-    if (url.pathname === "/api/channels" && request.method === "GET") return json((await env.DB.prepare("SELECT twitch_login, enabled, role_id, message_text, banner_key, color, CASE WHEN webhook_url <> '' THEN 1 ELSE 0 END AS has_webhook FROM channels ORDER BY twitch_login").all()).results);
+    const account = await getAccount(request, env);
+    if (!account) return json({ error: "Brak dostępu" }, 401);
+    if (url.pathname === "/api/me" && request.method === "GET") return json({ id: account.id, label: account.label, channels: account.channels });
+    if (url.pathname === "/api/channels" && request.method === "GET") {
+      const rows = (await env.DB.prepare("SELECT twitch_login, enabled, role_id, message_text, banner_key, color, CASE WHEN webhook_url <> '' THEN 1 ELSE 0 END AS has_webhook FROM channels ORDER BY twitch_login").all<{ twitch_login: string }>()).results;
+      return json(rows.filter(r => canAccess(account, r.twitch_login)));
+    }
     if (url.pathname === "/api/connect-twitch" && request.method === "POST") {
+      if (account.channels !== "all") return json({ error: "Brak dostępu" }, 403);
       try {
         const active = (await env.DB.prepare("SELECT twitch_login FROM channels WHERE enabled=1").all<{ twitch_login: string }>()).results;
         for (const row of active) await subscribeToTwitch(row.twitch_login, url.origin + "/eventsub", env);
@@ -133,6 +165,7 @@ export default {
     const match = url.pathname.match(/^\/api\/channels\/([a-z0-9_]+)(\/banner|\/test)?$/i);
     if (!match) return json({ error: "Nie znaleziono" }, 404);
     const login = match[1].toLowerCase();
+    if (!canAccess(account, login)) return json({ error: "Brak dostępu do tego kanału" }, 403);
     const channel = await env.DB.prepare("SELECT * FROM channels WHERE twitch_login = ?").bind(login).first<Channel>();
     if (!channel) return json({ error: "Nie znaleziono kanału" }, 404);
     if (match[2] === "/banner" && request.method === "POST") {
@@ -177,12 +210,12 @@ async function handleEventSub(request: Request, env: Env) {
   return new Response("OK");
 }
 
-const styles = `*{box-sizing:border-box}body{margin:0;background:#101014;color:#f5f5f5;font:16px system-ui,sans-serif}main{max-width:980px;margin:auto;padding:32px 20px}.login{max-width:420px;margin:12vh auto}.login form,.card{background:#1b1b21;border:1px solid #31313b;border-radius:14px;padding:20px}label{display:block;font-weight:600;margin:10px 0}input,textarea{display:block;width:100%;margin-top:7px;padding:10px;border:1px solid #454553;border-radius:8px;background:#101014;color:white;font:inherit}textarea{min-height:85px;resize:vertical}button{border:0;border-radius:8px;background:#7c3aed;color:white;font-weight:700;padding:10px 14px;cursor:pointer;margin:5px 6px 0 0}.secondary{background:#34343f}.danger{background:#b42318}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.card h2{text-transform:none;margin-top:0}.top{display:flex;align-items:center;justify-content:space-between;gap:10px}.hint{color:#aaa;font-size:.9rem}.error{color:#ff9b9b}.ok{color:#92f0a6}.banner{width:100%;max-height:120px;object-fit:cover;border-radius:8px;margin:8px 0}`;
-const adminPage = `<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stream Pings</title><style>${styles}</style><main><div class="top"><div><h1>Powiadomienia streamów</h1><p class="hint">Edytuj treść, role i banery. Zmiany zapisują się od razu.</p></div><div><button id="connect" class="secondary">Podłącz Twitch</button><a href="/logout"><button class="secondary">Wyloguj</button></a></div></div><p id="status" class="hint"></p><section id="channels" class="grid"></section></main><script>
+const styles = `*{box-sizing:border-box}body{margin:0;background:#000000;color:#f2f2f2;font:16px "Segoe UI",system-ui,sans-serif}main{max-width:980px;margin:auto;padding:32px 20px}.login{max-width:420px;margin:12vh auto}.login form,.card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:20px}h1{color:#f2f2f2;letter-spacing:.2px;margin:0}label{display:block;font-weight:600;margin:10px 0;color:#f2f2f2}input,textarea,select{display:block;width:100%;margin-top:7px;padding:10px;border:1px solid rgba(255,255,255,.14);border-radius:6px;background:#0d0d0f;color:#f2f2f2;font:inherit}input:focus,textarea:focus,select:focus{outline:none;border-color:#E3C048}textarea{min-height:85px;resize:vertical}button{border:0;border-radius:6px;background:#E3C048;color:#14120a;font-weight:700;padding:10px 14px;cursor:pointer;margin:5px 6px 0 0;transition:background .15s ease}button:hover{background:#43fbff}.secondary{background:rgba(255,255,255,.08);color:#f2f2f2}.secondary:hover{background:rgba(255,255,255,.16)}.danger{background:#b42318;color:#fff}.danger:hover{background:#d1281c}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.card h2{text-transform:none;margin-top:0;color:#E3C048;font-weight:700}.top{display:flex;align-items:center;justify-content:space-between;gap:10px}.hint{color:#9a9a9a;font-size:.9rem}.error{color:#ff9b9b}.ok{color:#92f0a6}.banner{width:100%;max-height:120px;object-fit:cover;border-radius:6px;margin:8px 0}`;
+const adminPage = (account: Account) => `<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stream Pings</title><style>${styles}</style><main><div class="top"><div><h1>Powiadomienia streamów</h1><p class="hint">Zalogowano jako: ${account.label}. Edytuj treść, role i banery. Zmiany zapisują się od razu.</p></div><div>${account.channels === "all" ? `<button id="connect" class="secondary">Podłącz Twitch</button>` : ""}<a href="/logout"><button class="secondary">Wyloguj</button></a></div></div><p id="status" class="hint"></p><section id="channels" class="grid"></section></main><script>
 const el=document.querySelector('#channels'),status=document.querySelector('#status');let channels=[];
 const esc=s=>String(s??'').replace(/[&<>\"]/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[x]));
 async function api(url,opt){const r=await fetch(url,opt);const d=await r.json();if(!r.ok)throw Error(d.error||'Błąd');return d}
 function render(){el.innerHTML=channels.map(c=>\`<article class="card"><h2>\${esc(c.twitch_login)}</h2><label><input data-f="enabled" type="checkbox" \${c.enabled?'checked':''}> Powiadomienia aktywne</label><label>ID roli<input data-f="role_id" inputmode="numeric" value="\${esc(c.role_id)}" placeholder="np. 123456789012345678"></label><label>Tekst<input data-f="message_text" value="\${esc(c.message_text)}"></label><label>Kolor embeda<input data-f="color" type="color" value="#\${Number(c.color).toString(16).padStart(6,'0')}"></label><label>Webhook Discorda<input data-f="webhook_url" type="password" placeholder="\${c.has_webhook?'zapisany — wpisz tylko aby zmienić':'https://discord.com/api/webhooks/...'}"></label>\${c.banner_key?\`<img class="banner" src="/assets/\${encodeURIComponent(c.banner_key)}">\`:''}<label>Grafika nad embedem<input data-f="banner" type="file" accept="image/png,image/jpeg,image/webp"></label><button data-a="save">Zapisz</button><button class="secondary" data-a="test">Wyślij test</button></article>\`).join('')}
 el.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;const card=b.closest('.card'),c=channels[[...el.children].indexOf(card)];try{if(b.dataset.a==='save'){const get=f=>card.querySelector('[data-f="'+f+'"]').value;await api('/api/channels/'+c.twitch_login,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({enabled:card.querySelector('[data-f="enabled"]').checked,role_id:get('role_id'),message_text:get('message_text'),webhook_url:get('webhook_url'),color:parseInt(get('color').slice(1),16)})});const file=card.querySelector('[data-f="banner"]').files[0];if(file){const f=new FormData();f.append('banner',file);await api('/api/channels/'+c.twitch_login+'/banner',{method:'POST',body:f})}status.textContent='Zapisano.';await load()}else{status.textContent='Wysyłam…';await api('/api/channels/'+c.twitch_login+'/test',{method:'POST'});status.textContent='Wysłano test.'}}catch(x){status.textContent=x.message;status.className='error'}})}
-document.querySelector('#connect').addEventListener('click',async()=>{try{status.textContent='Łączę kanały z Twitchem…';await api('/api/connect-twitch',{method:'POST'});status.textContent='Twitch został podłączony.'}catch(x){status.textContent=x.message;status.className='error'}})
+document.querySelector('#connect')?.addEventListener('click',async()=>{try{status.textContent='Łączę kanały z Twitchem…';await api('/api/connect-twitch',{method:'POST'});status.textContent='Twitch został podłączony.'}catch(x){status.textContent=x.message;status.className='error'}})
 async function load(){channels=await api('/api/channels');render()}load();</script></html>`;
