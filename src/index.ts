@@ -22,7 +22,7 @@ function canAccess(account: Account, login: string) {
 
 type Channel = {
   twitch_login: string; enabled: number; role_id: string; message_text: string;
-  banner_key: string | null; webhook_url: string; color: number;
+  display_name: string; banner_key: string | null; webhook_url: string; color: number;
 };
 
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), {
@@ -109,7 +109,7 @@ async function discord(channel: Channel, origin: string, stream: Awaited<ReturnT
   const payload = {
     allowed_mentions: { parse: [] },
     embeds: [{
-      author: { name: stream?.user_name ?? channel.twitch_login }, title,
+      author: { name: stream?.user_name ?? (channel.display_name || channel.twitch_login) }, title,
       url: `https://www.twitch.tv/${login}`, description: channel.message_text,
       color: channel.color,
       fields: [{ name: "Kategoria", value: game, inline: true }, { name: "Widzowie", value: String(viewers), inline: true }],
@@ -151,7 +151,7 @@ export default {
     if (!account) return json({ error: "Brak dostępu" }, 401);
     if (url.pathname === "/api/me" && request.method === "GET") return json({ id: account.id, label: account.label, channels: account.channels });
     if (url.pathname === "/api/channels" && request.method === "GET") {
-      const rows = (await env.DB.prepare("SELECT twitch_login, enabled, role_id, message_text, banner_key, color, CASE WHEN webhook_url <> '' THEN 1 ELSE 0 END AS has_webhook FROM channels ORDER BY twitch_login").all<{ twitch_login: string }>()).results;
+      const rows = (await env.DB.prepare("SELECT twitch_login, enabled, role_id, message_text, display_name, banner_key, color, CASE WHEN webhook_url <> '' THEN 1 ELSE 0 END AS has_webhook FROM channels ORDER BY twitch_login").all<{ twitch_login: string }>()).results;
       return json(rows.filter(r => canAccess(account, r.twitch_login)));
     }
     if (url.pathname === "/api/connect-twitch" && request.method === "POST") {
@@ -185,7 +185,7 @@ export default {
       const role = String(body.role_id ?? "").trim(), webhook = String(body.webhook_url ?? "").trim();
       if (role && !/^\d{17,20}$/.test(role)) return json({ error: "ID roli powinno składać się z 17–20 cyfr." }, 400);
       if (webhook && !/^https:\/\/((canary|ptb)\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/.+/.test(webhook)) return json({ error: "To nie wygląda na URL webhooka Discord." }, 400);
-      await env.DB.prepare("UPDATE channels SET enabled=?, role_id=?, message_text=?, webhook_url=?, color=?, updated_at=CURRENT_TIMESTAMP WHERE twitch_login=?").bind(body.enabled ? 1 : 0, role, String(body.message_text ?? "").slice(0, 2000), webhook || channel.webhook_url, Number(body.color) || 10181046, login).run();
+      await env.DB.prepare("UPDATE channels SET enabled=?, role_id=?, message_text=?, display_name=?, webhook_url=?, color=?, updated_at=CURRENT_TIMESTAMP WHERE twitch_login=?").bind(body.enabled ? 1 : 0, role, String(body.message_text ?? "").slice(0, 2000), String(body.display_name ?? "").slice(0, 100), webhook || channel.webhook_url, Number(body.color) || 10181046, login).run();
       return json({ ok: true });
     }
     return json({ error: "Nieobsługiwana operacja" }, 405);
@@ -215,8 +215,8 @@ const adminPage = (account: Account) => `<!doctype html><html lang="pl"><meta ch
 const el=document.querySelector('#channels'),status=document.querySelector('#status');let channels=[];
 const esc=s=>String(s??'').replace(/[&<>\"]/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[x]));
 async function api(url,opt){const r=await fetch(url,opt);const d=await r.json();if(!r.ok)throw Error(d.error||'Błąd');return d}
-function render(){el.innerHTML=channels.map(c=>\`<article class="card"><h2>\${esc(c.twitch_login)}</h2><label><input data-f="enabled" type="checkbox" \${c.enabled?'checked':''}> Powiadomienia aktywne</label><label>ID roli<input data-f="role_id" inputmode="numeric" value="\${esc(c.role_id)}" placeholder="np. 123456789012345678"></label><label>Tekst<input data-f="message_text" value="\${esc(c.message_text)}"></label><label>Kolor embeda<div class="colorrow"><input data-f="color" type="color" value="#\${Number(c.color).toString(16).padStart(6,'0')}"><input data-f="color_hex" type="text" maxlength="7" value="#\${Number(c.color).toString(16).padStart(6,'0')}" placeholder="#RRGGBB"></div></label><label>Webhook Discorda<input data-f="webhook_url" type="password" placeholder="\${c.has_webhook?'zapisany — wpisz tylko aby zmienić':'https://discord.com/api/webhooks/...'}"></label>\${c.banner_key?\`<img class="banner" src="/assets/\${encodeURIComponent(c.banner_key)}">\`:''}<label>Grafika nad embedem<input data-f="banner" type="file" accept="image/png,image/jpeg,image/webp"></label><button data-a="save">Zapisz</button><button class="secondary" data-a="test">Wyślij test</button></article>\`).join('')}
+function render(){el.innerHTML=channels.map(c=>\`<article class="card"><h2>\${esc(c.twitch_login)}</h2><label><input data-f="enabled" type="checkbox" \${c.enabled?'checked':''}> Powiadomienia aktywne</label><label>ID roli<input data-f="role_id" inputmode="numeric" value="\${esc(c.role_id)}" placeholder="np. 123456789012345678"></label><label>Tekst<input data-f="message_text" value="\${esc(c.message_text)}"></label><label>Nazwa wyświetlana<input data-f="display_name" value="\${esc(c.display_name)}" placeholder="np. Vivi"></label><label>Kolor embeda<div class="colorrow"><input data-f="color" type="color" value="#\${Number(c.color).toString(16).padStart(6,'0')}"><input data-f="color_hex" type="text" maxlength="7" value="#\${Number(c.color).toString(16).padStart(6,'0')}" placeholder="#RRGGBB"></div></label><label>Webhook Discorda<input data-f="webhook_url" type="password" placeholder="\${c.has_webhook?'zapisany — wpisz tylko aby zmienić':'https://discord.com/api/webhooks/...'}"></label>\${c.banner_key?\`<img class="banner" src="/assets/\${encodeURIComponent(c.banner_key)}">\`:''}<label>Grafika nad embedem<input data-f="banner" type="file" accept="image/png,image/jpeg,image/webp"></label><button data-a="save">Zapisz</button><button class="secondary" data-a="test">Wyślij test</button></article>\`).join('')}
 el.addEventListener('input',e=>{const t=e.target;if(t.dataset.f==='color'){const sib=t.parentElement.querySelector('[data-f="color_hex"]');if(sib)sib.value=t.value}if(t.dataset.f==='color_hex'){if(/^#[0-9a-fA-F]{6}$/.test(t.value)){const sib=t.parentElement.querySelector('[data-f="color"]');if(sib)sib.value=t.value}}})
-el.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;const card=b.closest('.card'),c=channels[[...el.children].indexOf(card)];try{if(b.dataset.a==='save'){const get=f=>card.querySelector('[data-f="'+f+'"]').value;await api('/api/channels/'+c.twitch_login,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({enabled:card.querySelector('[data-f="enabled"]').checked,role_id:get('role_id'),message_text:get('message_text'),webhook_url:get('webhook_url'),color:parseInt(get('color').slice(1),16)})});const file=card.querySelector('[data-f="banner"]').files[0];if(file){const f=new FormData();f.append('banner',file);await api('/api/channels/'+c.twitch_login+'/banner',{method:'POST',body:f})}status.textContent='Zapisano.';await load()}else{status.textContent='Wysyłam…';await api('/api/channels/'+c.twitch_login+'/test',{method:'POST'});status.textContent='Wysłano test.'}}catch(x){status.textContent=x.message;status.className='error'}})
+el.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;const card=b.closest('.card'),c=channels[[...el.children].indexOf(card)];try{if(b.dataset.a==='save'){const get=f=>card.querySelector('[data-f="'+f+'"]').value;await api('/api/channels/'+c.twitch_login,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({enabled:card.querySelector('[data-f="enabled"]').checked,role_id:get('role_id'),message_text:get('message_text'),display_name:get('display_name'),webhook_url:get('webhook_url'),color:parseInt(get('color').slice(1),16)})});const file=card.querySelector('[data-f="banner"]').files[0];if(file){const f=new FormData();f.append('banner',file);await api('/api/channels/'+c.twitch_login+'/banner',{method:'POST',body:f})}status.textContent='Zapisano.';await load()}else{status.textContent='Wysyłam…';await api('/api/channels/'+c.twitch_login+'/test',{method:'POST'});status.textContent='Wysłano test.'}}catch(x){status.textContent=x.message;status.className='error'}})
 document.querySelector('#connect')?.addEventListener('click',async()=>{try{status.textContent='Łączę kanały z Twitchem…';await api('/api/connect-twitch',{method:'POST'});status.textContent='Twitch został podłączony.'}catch(x){status.textContent=x.message;status.className='error'}})
 async function load(){channels=await api('/api/channels');render()}load();</script></html>`;
