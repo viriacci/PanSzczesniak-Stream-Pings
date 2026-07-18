@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "panszczesniakstreampings",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-18",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "stream-pings-db",
+      "database_id": "60953ec6-4235-47b5-b12b-600241488a28"
+    }
+  ]
+}

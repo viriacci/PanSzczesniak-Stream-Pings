@@ -1,0 +1,16 @@
+{
+  "name": "stream-pings",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "check": "tsc",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate": "wrangler d1 migrations apply stream-pings-db --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260718.1",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.28.0"
+  }
+}
