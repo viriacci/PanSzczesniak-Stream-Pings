@@ -93,7 +93,7 @@ function same(a: string, b: string) {
 }
 async function discord(channel: Channel, origin: string, stream: Awaited<ReturnType<typeof twitchStream>>, test = false) {
   if (!channel.webhook_url) throw new Error("Brakuje webhooka Discord dla tego kanału.");
-  const target = channel.webhook_url + (channel.webhook_url.includes("?") ? "&" : "?") + "wait=true";
+  const target = channel.webhook_url + (channel.webhook_url.includes("?") ? "&" : "?") + "wait=true&with_components=true";
   const role = channel.role_id ? `<@&${channel.role_id}>` : "";
   const mention = channel.role_id ? { parse: [], roles: [channel.role_id] } : { parse: [] };
   if (channel.banner_key) {
