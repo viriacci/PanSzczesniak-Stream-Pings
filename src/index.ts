@@ -62,7 +62,10 @@ function loginPage(error = "") {
 async function twitchToken(env: Env) {
   const form = new URLSearchParams({ client_id: env.TWITCH_CLIENT_ID, client_secret: env.TWITCH_CLIENT_SECRET, grant_type: "client_credentials" });
   const response = await fetch("https://id.twitch.tv/oauth2/token", { method: "POST", body: form });
-  if (!response.ok) throw new Error("Nie udało się pobrać tokenu Twitch.");
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Nie udało się pobrać tokenu Twitch (HTTP ${response.status}): ${detail.slice(0, 300)}`);
+  }
   return (await response.json() as { access_token: string }).access_token;
 }
 async function twitchStream(login: string, env: Env) {
