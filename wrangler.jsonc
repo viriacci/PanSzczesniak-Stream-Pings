@@ -9,5 +9,8 @@
       "database_name": "panszczesniakstreampingdb",
       "database_id": "60953ec6-4235-47b5-b12b-600241488a28"
     }
-  ]
+  ],
+  "triggers": {
+    "crons": ["0 6 * * *"]
+  }
 }
