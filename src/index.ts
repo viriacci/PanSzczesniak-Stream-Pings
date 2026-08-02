@@ -122,6 +122,21 @@ async function resolveYoutubeChannelId(input: string) {
   const titleMatch = html.match(/<meta property="og:title" content="([^"]*)"/);
   return { channelId: match[1], title: titleMatch ? titleMatch[1].replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'") : "" };
 }
+function extractVideoId(input: string) {
+  const trimmed = input.trim();
+  const patterns = [/(?:v=|\/shorts\/|youtu\.be\/)([A-Za-z0-9_-]{11})/, /^([A-Za-z0-9_-]{11})$/];
+  for (const pattern of patterns) {
+    const match = trimmed.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
+async function fetchVideoMeta(videoId: string) {
+  const response = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}&format=json`);
+  if (!response.ok) throw new Error("Nie znaleziono tego filmu na YouTube.");
+  const data = await response.json() as { title: string; author_name: string };
+  return { title: data.title, author: data.author_name };
+}
 async function subscribeYoutube(channelId: string, callback: string, env: Env) {
   const form = new URLSearchParams({
     "hub.callback": callback, "hub.topic": `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${channelId}`,
@@ -232,7 +247,7 @@ export default {
       const rows = (await env.DB.prepare("SELECT account_key, channel_url, channel_id, channel_title, enabled, role_id, message_text, color, lease_expires, CASE WHEN webhook_url <> '' THEN 1 ELSE 0 END AS has_webhook FROM youtube_channels ORDER BY account_key").all<{ account_key: string }>()).results;
       return json(rows.filter(r => canAccessYoutube(account, r.account_key)));
     }
-    const ytApiMatch = url.pathname.match(/^\/api\/youtube\/([a-z]+)(\/test)?$/i);
+    const ytApiMatch = url.pathname.match(/^\/api\/youtube\/([a-z]+)(\/test|\/ping)?$/i);
     if (ytApiMatch) {
       const key = ytApiMatch[1].toLowerCase();
       if (!canAccessYoutube(account, key)) return json({ error: "Brak dostępu do tego kanału" }, 403);
@@ -240,6 +255,17 @@ export default {
       if (!row) return json({ error: "Nie znaleziono kanału" }, 404);
       if (ytApiMatch[2] === "/test" && request.method === "POST") {
         try { await discordYoutube(row, null, true); return json({ ok: true }); } catch (error) { return json({ error: error instanceof Error ? error.message : "Błąd" }, 400); }
+      }
+      if (ytApiMatch[2] === "/ping" && request.method === "POST") {
+        try {
+          const body = await request.json() as { video_url?: string };
+          const videoId = extractVideoId(String(body.video_url ?? ""));
+          if (!videoId) return json({ error: "Nie rozpoznano linku do filmu YouTube." }, 400);
+          const meta = await fetchVideoMeta(videoId);
+          await env.DB.prepare("INSERT OR IGNORE INTO received_events(event_id) VALUES(?)").bind("yt:" + videoId).run();
+          await discordYoutube(row, { id: videoId, title: meta.title, author: meta.author });
+          return json({ ok: true });
+        } catch (error) { return json({ error: error instanceof Error ? error.message : "Błąd" }, 400); }
       }
       if (!ytApiMatch[2] && request.method === "PUT") {
         const body = await request.json() as Partial<YoutubeChannel>;
@@ -355,8 +381,8 @@ el.addEventListener('input',e=>{const t=e.target;if(t.dataset.f==='color'){const
 el.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;const card=b.closest('.card'),c=channels[[...el.children].indexOf(card)];try{if(b.dataset.a==='save'){const get=f=>card.querySelector('[data-f="'+f+'"]').value;await api('/api/channels/'+c.twitch_login,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({enabled:card.querySelector('[data-f="enabled"]').checked,role_id:get('role_id'),message_text:get('message_text'),display_name:get('display_name'),webhook_url:get('webhook_url'),color:parseInt(get('color').slice(1),16)})});const file=card.querySelector('[data-f="banner"]').files[0];if(file){const f=new FormData();f.append('banner',file);await api('/api/channels/'+c.twitch_login+'/banner',{method:'POST',body:f})}await load();toast('Zapisano.')}else{await api('/api/channels/'+c.twitch_login+'/test',{method:'POST'});toast('Wysłano test.')}}catch(x){toast(x.message,true)}})
 document.querySelector('#connect')?.addEventListener('click',async()=>{try{await api('/api/connect-twitch',{method:'POST'});toast('Twitch został podłączony.')}catch(x){toast(x.message,true)}})
 const ytEl=document.querySelector('#youtube');let ytChannels=[];
-function renderYt(){ytEl.innerHTML=ytChannels.map(c=>\`<article class="card"><h2>\${esc(c.account_key)}</h2><label><input data-f="enabled" type="checkbox" \${c.enabled?'checked':''}> Powiadomienia aktywne</label><label>Link do kanału YouTube<input data-f="channel_url" value="\${esc(c.channel_url)}" placeholder="np. youtube.com/@nazwa"></label>\${c.channel_id?\`<p class="hint">Podłączono: \${esc(c.channel_title||c.channel_id)}</p>\`:''}<label>ID roli<input data-f="role_id" inputmode="numeric" value="\${esc(c.role_id)}" placeholder="np. 123456789012345678"></label><label>Tekst<input data-f="message_text" value="\${esc(c.message_text)}"></label><label>Kolor embeda<div class="colorrow"><input data-f="color" type="color" value="#\${Number(c.color).toString(16).padStart(6,'0')}"><input data-f="color_hex" type="text" maxlength="7" value="#\${Number(c.color).toString(16).padStart(6,'0')}" placeholder="#RRGGBB"></div></label><label>Webhook Discorda<input data-f="webhook_url" type="password" placeholder="\${c.has_webhook?'zapisany — wpisz tylko aby zmienić':'https://discord.com/api/webhooks/...'}"></label><button data-a="save">Zapisz</button><button class="secondary" data-a="test">Wyślij test</button></article>\`).join('')}
+function renderYt(){ytEl.innerHTML=ytChannels.map(c=>\`<article class="card"><h2>\${esc(c.account_key)}</h2><label><input data-f="enabled" type="checkbox" \${c.enabled?'checked':''}> Powiadomienia aktywne</label><label>Link do kanału YouTube<input data-f="channel_url" value="\${esc(c.channel_url)}" placeholder="np. youtube.com/@nazwa"></label>\${c.channel_id?\`<p class="hint">Podłączono: \${esc(c.channel_title||c.channel_id)}</p>\`:''}<label>ID roli<input data-f="role_id" inputmode="numeric" value="\${esc(c.role_id)}" placeholder="np. 123456789012345678"></label><label>Tekst<input data-f="message_text" value="\${esc(c.message_text)}"></label><label>Kolor embeda<div class="colorrow"><input data-f="color" type="color" value="#\${Number(c.color).toString(16).padStart(6,'0')}"><input data-f="color_hex" type="text" maxlength="7" value="#\${Number(c.color).toString(16).padStart(6,'0')}" placeholder="#RRGGBB"></div></label><label>Webhook Discorda<input data-f="webhook_url" type="password" placeholder="\${c.has_webhook?'zapisany — wpisz tylko aby zmienić':'https://discord.com/api/webhooks/...'}"></label><button data-a="save">Zapisz</button><button class="secondary" data-a="test">Wyślij test</button><hr style="border-color:rgba(255,255,255,.1);margin:16px 0"><label>Ping o istniejącym filmie (link)<input data-f="video_url" placeholder="https://www.youtube.com/watch?v=..."></label><button class="secondary" data-a="ping">Wyślij ping o tym filmie</button></article>\`).join('')}
 ytEl.addEventListener('input',e=>{const t=e.target;if(t.dataset.f==='color'){const sib=t.parentElement.querySelector('[data-f="color_hex"]');if(sib)sib.value=t.value}if(t.dataset.f==='color_hex'){if(/^#[0-9a-fA-F]{6}$/.test(t.value)){const sib=t.parentElement.querySelector('[data-f="color"]');if(sib)sib.value=t.value}}})
-ytEl.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;const card=b.closest('.card'),c=ytChannels[[...ytEl.children].indexOf(card)];try{if(b.dataset.a==='save'){const get=f=>card.querySelector('[data-f="'+f+'"]').value;await api('/api/youtube/'+c.account_key,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({enabled:card.querySelector('[data-f="enabled"]').checked,channel_url:get('channel_url'),role_id:get('role_id'),message_text:get('message_text'),webhook_url:get('webhook_url'),color:parseInt(get('color').slice(1),16)})});await loadYt();toast('Zapisano.')}else{await api('/api/youtube/'+c.account_key+'/test',{method:'POST'});toast('Wysłano test.')}}catch(x){toast(x.message,true)}})
+ytEl.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;const card=b.closest('.card'),c=ytChannels[[...ytEl.children].indexOf(card)];try{if(b.dataset.a==='save'){const get=f=>card.querySelector('[data-f="'+f+'"]').value;await api('/api/youtube/'+c.account_key,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({enabled:card.querySelector('[data-f="enabled"]').checked,channel_url:get('channel_url'),role_id:get('role_id'),message_text:get('message_text'),webhook_url:get('webhook_url'),color:parseInt(get('color').slice(1),16)})});await loadYt();toast('Zapisano.')}else if(b.dataset.a==='test'){await api('/api/youtube/'+c.account_key+'/test',{method:'POST'});toast('Wysłano test.')}else if(b.dataset.a==='ping'){const video_url=card.querySelector('[data-f="video_url"]').value;await api('/api/youtube/'+c.account_key+'/ping',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({video_url})});toast('Wysłano ping o filmie.')}}catch(x){toast(x.message,true)}})
 async function loadYt(){ytChannels=await api('/api/youtube');renderYt()}loadYt();
 async function load(){channels=await api('/api/channels');render()}load();</script></html>`;
