@@ -39,7 +39,7 @@ function canAccessYoutube(account: Account, key: string) {
 }
 
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), {
-  status, headers: { "content-type": "application/json; charset=utf-8" }
+  status, headers: { "content-type": "application/json; charset=utf-8", "cache-control":"no-store", "X-Content-Type-Options":"nosniff" }
 });
 const encoder = new TextEncoder();
 
@@ -64,7 +64,7 @@ async function getAccount(request: Request, env: Env): Promise<Account | null> {
   return { id, label: config.label, channels: config.channels };
 }
 function html(body: string, status = 200, headers: HeadersInit = {}) {
-  return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", ...headers } });
+  return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control":"no-store", "X-Content-Type-Options":"nosniff", "X-Frame-Options":"DENY", ...headers } });
 }
 function loginPage(error = "") {
   const options = Object.entries(ACCOUNTS).map(([id, a]) => `<option value="${id}">${a.label}</option>`).join("");
@@ -102,6 +102,30 @@ async function subscribeToTwitch(login: string, callback: string, env: Env) {
   const response = await fetch("https://api.twitch.tv/helix/eventsub/subscriptions", { method: "POST", headers: { "Client-Id": env.TWITCH_CLIENT_ID, Authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ type: "stream.online", version: "1", condition: { broadcaster_user_id: user.id }, transport: { method: "webhook", callback, secret: env.TWITCH_EVENTSUB_SECRET } }) });
   if (response.status === 409) return;
   if (!response.ok) throw new Error(`Twitch nie utworzył subskrypcji dla ${login}.`);
+}
+async function reconcileTwitch(env:Env, origin:string) {
+  const token=await twitchToken(env);
+  const headers={"Client-Id":env.TWITCH_CLIENT_ID,Authorization:"Bearer "+token};
+  const rows=(await env.DB.prepare("SELECT twitch_login FROM channels WHERE enabled=1 AND webhook_url<>''").all<{twitch_login:string}>()).results;
+  const cb=origin+"/eventsub";
+  for(const row of rows){
+    try {
+      const userResponse=await fetch("https://api.twitch.tv/helix/users?login="+encodeURIComponent(row.twitch_login),{headers,signal:AbortSignal.timeout(10000)});
+      if(!userResponse.ok)throw new Error("Twitch user lookup HTTP "+userResponse.status);
+      const user=(await userResponse.json() as {data:{id:string}[]}).data[0];
+      if(!user)throw new Error("Unknown Twitch user");
+      const subResponse=await fetch("https://api.twitch.tv/helix/eventsub/subscriptions?user_id="+encodeURIComponent(user.id),{headers,signal:AbortSignal.timeout(10000)});
+      if(!subResponse.ok)throw new Error("Twitch subscription lookup HTTP "+subResponse.status);
+      const subscriptions=(await subResponse.json() as {data:{id:string;type:string;status:string;transport:{callback?:string}}[]}).data;
+      const ours=subscriptions.filter(x=>x.type==="stream.online"&&x.transport.callback===cb);
+      if(ours.some(x=>x.status==="enabled"||x.status==="webhook_callback_verification_pending"))continue;
+      for(const old of ours){
+        const deleted=await fetch("https://api.twitch.tv/helix/eventsub/subscriptions?id="+encodeURIComponent(old.id),{method:"DELETE",headers,signal:AbortSignal.timeout(10000)});
+        if(!deleted.ok && deleted.status!==404)throw new Error("Twitch subscription delete HTTP "+deleted.status);
+      }
+      await subscribeToTwitch(row.twitch_login,cb,env);
+    }catch(e){console.error("Twitch reconciliation failed",row.twitch_login,e instanceof Error?e.message:"error");}
+  }
 }
 async function hmacHex(secret: string, data: string) {
   const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -158,8 +182,8 @@ async function subscribeYoutube(channelId: string, callback: string, env: Env) {
 async function discordYoutube(row: YoutubeChannel, video: { id: string; title: string; author: string } | null, test = false) {
   if (!row.webhook_url) throw new Error("Brakuje webhooka Discord dla tego kanału.");
   const target = row.webhook_url + (row.webhook_url.includes("?") ? "&" : "?") + "wait=true&with_components=true";
-  const role = row.role_id ? `<@&${row.role_id}>` : "";
-  const mention = row.role_id ? { parse: [], roles: [row.role_id] } : { parse: [] };
+  const role = !test && row.role_id ? `<@&${row.role_id}>` : "";
+  const mention = !test && row.role_id ? { parse: [], roles: [row.role_id] } : { parse: [] };
   const id = video?.id ?? "dQw4w9WgXcQ";
   const title = video?.title ?? (test ? "To jest wiadomość testowa" : "Nowy film");
   const author = video?.author ?? row.channel_title;
@@ -178,8 +202,8 @@ async function discordYoutube(row: YoutubeChannel, video: { id: string; title: s
 async function discord(channel: Channel, origin: string, stream: Awaited<ReturnType<typeof twitchStream>>, test = false) {
   if (!channel.webhook_url) throw new Error("Brakuje webhooka Discord dla tego kanału.");
   const target = channel.webhook_url + (channel.webhook_url.includes("?") ? "&" : "?") + "wait=true&with_components=true";
-  const role = channel.role_id ? `<@&${channel.role_id}>` : "";
-  const mention = channel.role_id ? { parse: [], roles: [channel.role_id] } : { parse: [] };
+  const role = !test && channel.role_id ? `<@&${channel.role_id}>` : "";
+  const mention = !test && channel.role_id ? { parse: [], roles: [channel.role_id] } : { parse: [] };
 
   const title = stream?.title ?? (test ? "To jest wiadomość testowa" : "Stream trwa");
   const game = stream?.game_name || "Just Chatting";
@@ -218,6 +242,9 @@ function validColor(value:unknown) {
 }
 async function ensureSchema(env:Env) {
   await env.DB.batch([
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS channels(twitch_login TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,role_id TEXT NOT NULL DEFAULT '',message_text TEXT NOT NULL DEFAULT 'Wbijaj na stream! ✨',display_name TEXT NOT NULL DEFAULT '',banner_key TEXT,webhook_url TEXT NOT NULL DEFAULT '',color INTEGER NOT NULL DEFAULT 10181046,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS received_events(event_id TEXT PRIMARY KEY,received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS banners(banner_key TEXT PRIMARY KEY,content BLOB NOT NULL,content_type TEXT NOT NULL)"),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,account_id TEXT NOT NULL,credential_tag TEXT NOT NULL,expires_at INTEGER NOT NULL)"),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS login_limits(key TEXT PRIMARY KEY,window INTEGER NOT NULL,count INTEGER NOT NULL)"),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS delivery_queue(event_key TEXT PRIMARY KEY,kind TEXT NOT NULL,recipient TEXT NOT NULL,payload TEXT NOT NULL,origin TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)"),
@@ -236,8 +263,8 @@ async function ensureSchema(env:Env) {
     env.DB.prepare("INSERT OR IGNORE INTO youtube_channels(account_key) VALUES('panszczesniak'),('shiroe'),('vivi')")
   ]);
 }
-let schemaReady = false;
-async function ready(env:Env) {if(!schemaReady){await ensureSchema(env);schemaReady=true;}}
+let schemaPromise:Promise<void>|null=null;
+async function ready(env:Env) {if(!schemaPromise)schemaPromise=ensureSchema(env).catch(e=>{schemaPromise=null;throw e;});await schemaPromise;}
 async function enqueue(env:Env,eventKey:string,kind:string,recipient:string,payload:unknown,origin:string) {
   await env.DB.prepare("INSERT OR IGNORE INTO delivery_queue(event_key,kind,recipient,payload,origin,next_at,updated_at) VALUES(?,?,?,?,?,?,?)").bind(eventKey,kind,recipient,JSON.stringify(payload),origin,Date.now(),Date.now()).run();
 }
@@ -251,7 +278,12 @@ async function deliver(env:Env,key:string) {
   try {
     if(job.kind==="twitch") {
       const channel=await env.DB.prepare("SELECT * FROM channels WHERE twitch_login=? AND enabled=1").bind(job.recipient).first<Channel>();
-      if(channel){const stream=await twitchStream(job.recipient,env);if(!stream)throw new Error("Twitch stream metadata unavailable");await discord(channel,job.origin,stream);}
+      if(channel){
+        let stream:Awaited<ReturnType<typeof twitchStream>>=null;
+        try {stream=await twitchStream(job.recipient,env);} catch(e){if(job.attempts<3)throw e;}
+        if(!stream && job.attempts<3)throw new Error("Twitch stream metadata unavailable");
+        await discord(channel,job.origin,stream);
+      }
     } else {
       const row=await env.DB.prepare("SELECT * FROM youtube_channels WHERE account_key=? AND enabled=1").bind(job.recipient).first<YoutubeChannel>();
       if(row)await discordYoutube(row,JSON.parse(job.payload));
@@ -401,9 +433,10 @@ export default {
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
     await ready(env);
     const now=Date.now();
-    const jobs=(await env.DB.prepare("SELECT event_key FROM delivery_queue WHERE status IN ('pending','sending') AND next_at<=? ORDER BY next_at LIMIT 10").bind(now).all<{event_key:string}>()).results;
+    const jobs=(await env.DB.prepare("SELECT event_key FROM delivery_queue WHERE status IN ('pending','sending') AND next_at<=? ORDER BY next_at LIMIT 4").bind(now).all<{event_key:string}>()).results;
     for(const job of jobs)await deliver(env,job.event_key);
     if(event.cron!=="0 6 * * *")return;
+    ctx.waitUntil(reconcileTwitch(env,env.PUBLIC_ORIGIN || "https://pssp.viriacci.workers.dev"));
     await env.DB.batch([
       env.DB.prepare("DELETE FROM sessions WHERE expires_at<=?").bind(now),
       env.DB.prepare("DELETE FROM login_limits WHERE window<?").bind(Math.floor(now/900000)-4),
@@ -433,6 +466,7 @@ async function handleEventSub(request: Request, env: Env, ctx: ExecutionContext)
   const type = request.headers.get("Twitch-Eventsub-Message-Type");
   const body = JSON.parse(raw);
   if (type === "webhook_callback_verification") return new Response(body.challenge, { headers: { "content-type": "text/plain" } });
+  if(type==="revocation"){console.warn("Twitch subscription revoked",body.subscription?.status);return new Response("OK");}
   if (type !== "notification" || body.subscription?.type !== "stream.online") return new Response("OK");
   const login = String(body.event?.broadcaster_user_login ?? "").toLowerCase();
   if(!/^[a-z0-9_]+$/.test(login))return new Response("Invalid event",{status:400});

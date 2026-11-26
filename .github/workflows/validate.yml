@@ -1,0 +1,19 @@
+name: Validate Stream Pings
+on:
+  push:
+    branches: [main, 'audit/**']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - run: npm install --ignore-scripts
+      - run: npm run check
+      - run: python -c "import sqlite3; db=sqlite3.connect(':memory:'); db.executescript(open('schema.sql').read()); db.executescript(open('schema.sql').read())"
+      - run: npx wrangler deploy --dry-run --outdir dist
