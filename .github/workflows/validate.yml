@@ -1,5 +1,6 @@
 name: Validate Stream Pings
 on:
+  workflow_dispatch:
   push:
     branches: [main, 'audit/**']
   pull_request:
