@@ -310,8 +310,8 @@ export default {
         const failures=await env.DB.prepare("SELECT COUNT(*) AS n FROM delivery_queue WHERE status='failed' OR (status IN ('pending','sending') AND updated_at<?)").bind(Date.now()-3600000).first<{n:number}>();
         const stale=await env.DB.prepare("SELECT COUNT(*) AS n FROM youtube_channels WHERE enabled=1 AND channel_id<>'' AND (lease_expires IS NULL OR lease_expires<?)").bind(new Date().toISOString()).first<{n:number}>();
         const ok=!(failures?.n||stale?.n);
-        return json({ok},ok?200:503);
-      }catch{return json({ok:false},503);}
+        return new Response(JSON.stringify({ok}),{status:ok?200:503,headers:{"content-type":"application/json","cache-control":"no-store","access-control-allow-origin":"https://admin.panszczesniak.pl","Vary":"Origin","X-Content-Type-Options":"nosniff"}});
+      }catch{return new Response('{"ok":false}',{status:503,headers:{"content-type":"application/json","cache-control":"no-store","access-control-allow-origin":"https://admin.panszczesniak.pl","Vary":"Origin"}});}
     }
     if (url.pathname === "/favicon.png") {
       const bytes = Uint8Array.from(atob(FAVICON_B64), c => c.charCodeAt(0));
