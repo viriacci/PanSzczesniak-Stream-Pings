@@ -84,7 +84,7 @@ async function twitchToken(env: Env) {
   tokenCache = {token:data.access_token, expires:Date.now()+Math.max(0,data.expires_in-60)*1000,client:env.TWITCH_CLIENT_ID};
   return data.access_token;
 }
-async function twitchStream(login: string, env: Env) {
+async function twitchStream(login: string, env: Env): Promise<{title:string;game_name:string;viewer_count:number;thumbnail_url:string;user_login:string;user_name:string}|null> {
   const token = await twitchToken(env);
   const response = await fetch("https://api.twitch.tv/helix/streams?user_login=" + encodeURIComponent(login), {
     headers: { "Client-Id": env.TWITCH_CLIENT_ID, Authorization: "Bearer " + token }
