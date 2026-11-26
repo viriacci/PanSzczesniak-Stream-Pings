@@ -6,7 +6,7 @@
     "check": "tsc",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:migrate": "wrangler d1 migrations apply stream-pings-db --remote"
+    "db:migrate": "wrangler d1 migrations apply panszczesniakstreampingdb --remote"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260718.1",

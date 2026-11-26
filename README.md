@@ -1,12 +1,3 @@
 # Stream Pings
 
-Własny panel powiadomień Twitch → Discord dla kanałów `ViviOnyx`, `Shiroe_com` i `PanSzczesniak`.
-
-## Wdrożenie
-
-1. Utwórz D1 o nazwie `stream-pings-db` i wykonaj w nim zawartość `schema.sql`.
-2. Połącz to repozytorium z Cloudflare Workers. Build command: `npm install`; Deploy command: `npx wrangler deploy`.
-3. W Workerze dodaj binding D1 jako `DB`.
-4. Dodaj sekrety: `ADMIN_PASSWORD`, `SESSION_SECRET`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, `TWITCH_EVENTSUB_SECRET`.
-
-Sekretów nie wolno dodawać do GitHuba.
+Twitch / YouTube → Discord, Cloudflare Workers + D1. Production entry point: src/index.ts. Existing database is upgraded additively on first request; schema.sql is for fresh installations. No secrets in git. Required secrets: ADMIN_PASSWORD, PASSWORD_SHIROE, PASSWORD_VIVI, SESSION_SECRET, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_EVENTSUB_SECRET, YOUTUBE_WEBSUB_SECRET. Optional PUBLIC_ORIGIN overrides the default WebSub callback origin. Existing sessions must log in again after the security update. Queue retry runs every 5 minutes; daily cron renews YouTube and cleans old technical state. Check with npm install && npm run check before deploying. No separate migration command is needed for existing installations.

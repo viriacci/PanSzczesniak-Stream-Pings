@@ -10,6 +10,7 @@ interface Env {
   TWITCH_CLIENT_SECRET: string;
   TWITCH_EVENTSUB_SECRET: string;
   YOUTUBE_WEBSUB_SECRET: string;
+  PUBLIC_ORIGIN?: string;
 }
 
 type AccountId = "panszczesniak" | "shiroe" | "vivi";
@@ -56,9 +57,10 @@ async function getAccount(request: Request, env: Env): Promise<Account | null> {
   if (dot < 0) return null;
   const id = value.slice(0, dot) as AccountId;
   const hash = value.slice(dot + 1);
-  const config = ACCOUNTS[id];
-  if (!config) return null;
-  if (!same(hash, await sha256(id + ":" + env.SESSION_SECRET))) return null;
+  const config = Object.hasOwn(ACCOUNTS, id) ? ACCOUNTS[id] : undefined;
+  if (!config || !env.SESSION_SECRET || !env[config.passwordEnv] || !/^[a-f0-9]{64}$/.test(hash)) return null;
+  const session = await env.DB.prepare("SELECT account_id, credential_tag FROM sessions WHERE token_hash=? AND expires_at>?").bind(await sha256(hash), Date.now()).first<{account_id:string;credential_tag:string}>();
+  if (!session || session.account_id !== id || !same(session.credential_tag, await hmacHex(env.SESSION_SECRET, id + ":" + env[config.passwordEnv]))) return null;
   return { id, label: config.label, channels: config.channels };
 }
 function html(body: string, status = 200, headers: HeadersInit = {}) {
@@ -69,14 +71,18 @@ function loginPage(error = "") {
   return `<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.png"><title>Stream Pings</title><style>${styles}</style><main class="login"><h1>Stream Pings</h1><p>Panel administracyjny</p>${error ? `<p class="error">${error}</p>` : ""}<form method="post" action="/login"><label>Konto<select name="login">${options}</select></label><label>Hasło<input required type="password" name="password" autofocus></label><button>Zaloguj się</button></form></main></html>`;
 }
 
+let tokenCache: { token:string; expires:number; client:string } | null = null;
 async function twitchToken(env: Env) {
+  if (tokenCache?.client === env.TWITCH_CLIENT_ID && tokenCache.expires > Date.now()) return tokenCache.token;
   const form = new URLSearchParams({ client_id: env.TWITCH_CLIENT_ID, client_secret: env.TWITCH_CLIENT_SECRET, grant_type: "client_credentials" });
   const response = await fetch("https://id.twitch.tv/oauth2/token", { method: "POST", body: form });
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     throw new Error(`Nie udało się pobrać tokenu Twitch (HTTP ${response.status}): ${detail.slice(0, 300)}`);
   }
-  return (await response.json() as { access_token: string }).access_token;
+  const data = await response.json() as {access_token:string;expires_in:number};
+  tokenCache = {token:data.access_token, expires:Date.now()+Math.max(0,data.expires_in-60)*1000,client:env.TWITCH_CLIENT_ID};
+  return data.access_token;
 }
 async function twitchStream(login: string, env: Env) {
   const token = await twitchToken(env);
@@ -90,6 +96,7 @@ async function twitchStream(login: string, env: Env) {
 async function subscribeToTwitch(login: string, callback: string, env: Env) {
   const token = await twitchToken(env);
   const userResponse = await fetch("https://api.twitch.tv/helix/users?login=" + encodeURIComponent(login), { headers: { "Client-Id": env.TWITCH_CLIENT_ID, Authorization: "Bearer " + token } });
+  if (!userResponse.ok) throw new Error("Twitch users API HTTP " + userResponse.status);
   const user = (await userResponse.json() as { data: Array<{ id: string }> }).data[0];
   if (!user) throw new Error(`Nie znaleziono kanału Twitch: ${login}`);
   const response = await fetch("https://api.twitch.tv/helix/eventsub/subscriptions", { method: "POST", headers: { "Client-Id": env.TWITCH_CLIENT_ID, Authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ type: "stream.online", version: "1", condition: { broadcaster_user_id: user.id }, transport: { method: "webhook", callback, secret: env.TWITCH_EVENTSUB_SECRET } }) });
@@ -113,8 +120,11 @@ async function hmacSha1Hex(secret: string, data: ArrayBuffer) {
 }
 async function resolveYoutubeChannelId(input: string) {
   let target = input.trim();
+  if (/^(www\.)?youtube\.com\//i.test(target)) target = "https://" + target;
   if (!/^https?:\/\//i.test(target)) target = "https://www.youtube.com/" + target.replace(/^@?/, "@");
-  const response = await fetch(target, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const parsed = new URL(target);
+  if (parsed.protocol !== "https:" || !["youtube.com","www.youtube.com","m.youtube.com"].includes(parsed.hostname) || parsed.username || parsed.password || parsed.port) throw new Error("Podaj adres HTTPS kanału YouTube.");
+  const response = await fetch(parsed, { redirect: "error", headers: { "User-Agent": "Mozilla/5.0" } });
   if (!response.ok) throw new Error("Nie udało się otworzyć strony kanału YouTube.");
   const html = await response.text();
   const match = html.match(/channel_id=(UC[0-9A-Za-z_-]{22})/) ?? html.match(/"channelId":"(UC[0-9A-Za-z_-]{22})"/);
@@ -162,7 +172,7 @@ async function discordYoutube(row: YoutubeChannel, video: { id: string; title: s
     }],
     components: [{ type: 1, components: [{ type: 2, style: 5, label: "Obejrzyj film", url: `https://www.youtube.com/watch?v=${id}` }] }]
   };
-  const response = await fetch(target, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+  const response = await sendDiscord(target, payload);
   if (!response.ok) throw new Error("Discord odrzucił wiadomość (sprawdź webhook i uprawnienia roli).");
 }
 async function discord(channel: Channel, origin: string, stream: Awaited<ReturnType<typeof twitchStream>>, test = false) {
@@ -170,11 +180,7 @@ async function discord(channel: Channel, origin: string, stream: Awaited<ReturnT
   const target = channel.webhook_url + (channel.webhook_url.includes("?") ? "&" : "?") + "wait=true&with_components=true";
   const role = channel.role_id ? `<@&${channel.role_id}>` : "";
   const mention = channel.role_id ? { parse: [], roles: [channel.role_id] } : { parse: [] };
-  if (channel.banner_key) {
-    await fetch(target, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
-      allowed_mentions: { parse: [] }, embeds: [{ image: { url: `${origin}/assets/${encodeURIComponent(channel.banner_key)}` }, color: channel.color }]
-    }) });
-  }
+
   const title = stream?.title ?? (test ? "To jest wiadomość testowa" : "Stream trwa");
   const game = stream?.game_name || "Just Chatting";
   const viewers = stream?.viewer_count ?? 0;
@@ -182,7 +188,7 @@ async function discord(channel: Channel, origin: string, stream: Awaited<ReturnT
   const login = stream?.user_login ?? channel.twitch_login;
   const payload = {
     content: role, allowed_mentions: mention,
-    embeds: [{
+    embeds: [...(channel.banner_key ? [{image:{url:`${origin}/assets/${encodeURIComponent(channel.banner_key)}`},color:channel.color}] : []), {
       author: { name: stream?.user_name ?? (channel.display_name || channel.twitch_login) }, title,
       url: `https://www.twitch.tv/${login}`, description: channel.message_text,
       color: channel.color,
@@ -191,10 +197,71 @@ async function discord(channel: Channel, origin: string, stream: Awaited<ReturnT
     }],
     components: [{ type: 1, components: [{ type: 2, style: 5, label: "Oglądaj teraz", url: `https://www.twitch.tv/${login}` }] }]
   };
-  const response = await fetch(target, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+  const response = await sendDiscord(target, payload);
   if (!response.ok) throw new Error("Discord odrzucił wiadomość (sprawdź webhook i uprawnienia roli).");
 }
 
+async function sendDiscord(target:string,payload:unknown) {
+  const u = new URL(target);
+  if (u.protocol !== "https:" || !["discord.com","discordapp.com","canary.discord.com","ptb.discord.com","canary.discordapp.com","ptb.discordapp.com"].includes(u.hostname) || u.username || u.password || u.port || !/^\/api\/webhooks\/\d+\/[A-Za-z0-9_-]+$/.test(u.pathname)) throw new Error("Niepoprawny webhook Discord");
+  return fetch(u, {method:"POST",redirect:"error",headers:{"content-type":"application/json"},body:JSON.stringify(payload),signal:AbortSignal.timeout(12000)});
+}
+function validWebhook(value:string) {
+  try {
+    const u = new URL(value);
+    return u.protocol === "https:" && ["discord.com","discordapp.com","canary.discord.com","ptb.discord.com","canary.discordapp.com","ptb.discordapp.com"].includes(u.hostname) && !u.username && !u.password && !u.port && /^\/api\/webhooks\/\d+\/[A-Za-z0-9_-]+$/.test(u.pathname);
+  } catch {return false;}
+}
+function validColor(value:unknown) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 && n <= 0xffffff ? n : 10181046;
+}
+async function ensureSchema(env:Env) {
+  await env.DB.batch([
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,account_id TEXT NOT NULL,credential_tag TEXT NOT NULL,expires_at INTEGER NOT NULL)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS login_limits(key TEXT PRIMARY KEY,window INTEGER NOT NULL,count INTEGER NOT NULL)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS delivery_queue(event_key TEXT PRIMARY KEY,kind TEXT NOT NULL,recipient TEXT NOT NULL,payload TEXT NOT NULL,origin TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)"),
+    env.DB.prepare("CREATE INDEX IF NOT EXISTS delivery_due ON delivery_queue(status,next_at)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS youtube_channels(account_key TEXT PRIMARY KEY,channel_url TEXT NOT NULL DEFAULT '',channel_id TEXT NOT NULL DEFAULT '',channel_title TEXT NOT NULL DEFAULT '',enabled INTEGER NOT NULL DEFAULT 0,role_id TEXT NOT NULL DEFAULT '',message_text TEXT NOT NULL DEFAULT '',webhook_url TEXT NOT NULL DEFAULT '',color INTEGER NOT NULL DEFAULT 10181046,lease_expires TEXT,updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+  ]);
+  const cols = (await env.DB.prepare("PRAGMA table_info(channels)").all<{name:string}>()).results;
+  if (!cols.some(c=>c.name==="display_name")) {
+    try {await env.DB.prepare("ALTER TABLE channels ADD COLUMN display_name TEXT NOT NULL DEFAULT ''").run();}
+    catch(e) {const check=(await env.DB.prepare("PRAGMA table_info(channels)").all<{name:string}>()).results;if(!check.some(c=>c.name==="display_name")) throw e;}
+  }
+  await env.DB.batch([
+    env.DB.prepare("INSERT OR IGNORE INTO channels(twitch_login,enabled,role_id,message_text,display_name,banner_key,webhook_url,color) SELECT 'vivionyx',enabled,role_id,message_text,display_name,banner_key,webhook_url,color FROM channels WHERE twitch_login='vivionyxx'"),
+    env.DB.prepare("INSERT OR IGNORE INTO channels(twitch_login) VALUES('vivionyx'),('shiroe_com'),('panszczesniak')"),
+    env.DB.prepare("UPDATE channels SET enabled=0 WHERE twitch_login='vivionyxx' AND enabled<>0"),
+    env.DB.prepare("INSERT OR IGNORE INTO youtube_channels(account_key) VALUES('panszczesniak'),('shiroe'),('vivi')")
+  ]);
+}
+let schemaReady = false;
+async function ready(env:Env) {if(!schemaReady){await ensureSchema(env);schemaReady=true;}}
+async function enqueue(env:Env,eventKey:string,kind:string,recipient:string,payload:unknown,origin:string) {
+  await env.DB.prepare("INSERT OR IGNORE INTO delivery_queue(event_key,kind,recipient,payload,origin,next_at,updated_at) VALUES(?,?,?,?,?,?,?)").bind(eventKey,kind,recipient,JSON.stringify(payload),origin,Date.now(),Date.now()).run();
+}
+type Delivery = {event_key:string;kind:string;recipient:string;payload:string;origin:string;attempts:number};
+async function deliver(env:Env,key:string) {
+  const now=Date.now();
+  const claim=await env.DB.prepare("UPDATE delivery_queue SET status='sending',attempts=attempts+1,next_at=?,updated_at=? WHERE event_key=? AND ((status='pending' AND next_at<=?) OR (status='sending' AND next_at<=?))").bind(now+120000,now,key,now,now).run();
+  if(!claim.meta.changes)return;
+  const job=await env.DB.prepare("SELECT * FROM delivery_queue WHERE event_key=?").bind(key).first<Delivery>();
+  if(!job)return;
+  try {
+    if(job.kind==="twitch") {
+      const channel=await env.DB.prepare("SELECT * FROM channels WHERE twitch_login=? AND enabled=1").bind(job.recipient).first<Channel>();
+      if(channel){const stream=await twitchStream(job.recipient,env);if(!stream)throw new Error("Twitch stream metadata unavailable");await discord(channel,job.origin,stream);}
+    } else {
+      const row=await env.DB.prepare("SELECT * FROM youtube_channels WHERE account_key=? AND enabled=1").bind(job.recipient).first<YoutubeChannel>();
+      if(row)await discordYoutube(row,JSON.parse(job.payload));
+    }
+    await env.DB.prepare("UPDATE delivery_queue SET status='delivered',updated_at=? WHERE event_key=?").bind(Date.now(),key).run();
+  } catch(e) {
+    console.error("Delivery failed",job.kind,job.recipient,job.attempts,e instanceof Error?e.message:"error");
+    await env.DB.prepare("UPDATE delivery_queue SET status=?,next_at=?,updated_at=? WHERE event_key=?").bind(job.attempts>=8?"failed":"pending",Date.now()+Math.min(3600000,60000*2**Math.min(job.attempts,5)),Date.now(),key).run();
+  }
+}
 async function adminApp(request: Request, env: Env) {
   const account = await getAccount(request, env);
   if (!account) return new Response(null, { status: 302, headers: { Location: "/login" } });
@@ -202,7 +269,8 @@ async function adminApp(request: Request, env: Env) {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    await ready(env);
     const url = new URL(request.url);
     if (url.pathname === "/favicon.png") {
       const bytes = Uint8Array.from(atob(FAVICON_B64), c => c.charCodeAt(0));
@@ -210,22 +278,32 @@ export default {
     }
     if (url.pathname.startsWith("/assets/")) {
       const banner = await env.DB.prepare("SELECT content, content_type FROM banners WHERE banner_key=?").bind(decodeURIComponent(url.pathname.slice(8))).first<{ content: ArrayBuffer; content_type: string }>();
-      return banner ? new Response(banner.content, { headers: { "content-type": banner.content_type, "cache-control": "public, max-age=300" } }) : new Response("Nie znaleziono grafiki", { status: 404 });
+      return banner && ["image/png","image/jpeg","image/webp"].includes(banner.content_type) ? new Response(banner.content, { headers: { "content-type": banner.content_type, "cache-control": "public, max-age=300", "X-Content-Type-Options":"nosniff" } }) : new Response("Nie znaleziono grafiki", { status: 404 });
     }
-    if (url.pathname === "/eventsub" && request.method === "POST") return handleEventSub(request, env);
+    if (url.pathname === "/eventsub" && request.method === "POST") return handleEventSub(request, env, ctx);
     const ytMatch = url.pathname.match(/^\/youtube-callback\/([a-z]+)$/i);
     if (ytMatch && request.method === "GET") return handleYoutubeVerify(request);
-    if (ytMatch && request.method === "POST") return handleYoutubeNotification(request, env, ytMatch[1]);
+    if (ytMatch && request.method === "POST") return handleYoutubeNotification(request, env, ytMatch[1], ctx);
     if (url.pathname === "/login" && request.method === "GET") return html(loginPage());
     if (url.pathname === "/login" && request.method === "POST") {
       const form = await request.formData();
       const id = String(form.get("login") ?? "") as AccountId;
-      const config = ACCOUNTS[id];
+      const config = Object.hasOwn(ACCOUNTS,id) ? ACCOUNTS[id] : undefined;
       const password = String(form.get("password") ?? "");
-      if (!config || !same(password, env[config.passwordEnv] ?? "")) return html(loginPage("Nieprawidłowe konto lub hasło."), 401);
-      return new Response(null, { status: 302, headers: { Location: "/admin", "Set-Cookie": `stream_pings_session=${id}.${await sha256(id + ":" + env.SESSION_SECRET)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000` } });
+      const limitKey=await sha256(request.headers.get("CF-Connecting-IP") || "unknown");
+      const window=Math.floor(Date.now()/900000);
+      const attempt=await env.DB.prepare("INSERT INTO login_limits(key,window,count) VALUES(?,?,1) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN window=excluded.window THEN count+1 ELSE 1 END,window=excluded.window RETURNING count").bind(limitKey,window).first<{count:number}>();
+      if((attempt?.count??0)>10)return html(loginPage("Za dużo prób. Spróbuj za 15 minut."),429);
+      if (!config || !env.SESSION_SECRET || !env[config.passwordEnv] || !password || !same(password, env[config.passwordEnv])) return html(loginPage("Nieprawidłowe konto lub hasło."), 401);
+      const token=[...crypto.getRandomValues(new Uint8Array(32))].map(x=>x.toString(16).padStart(2,"0")).join("");
+      await env.DB.prepare("INSERT INTO sessions(token_hash,account_id,credential_tag,expires_at) VALUES(?,?,?,?)").bind(await sha256(token),id,await hmacHex(env.SESSION_SECRET,id+":"+env[config.passwordEnv]),Date.now()+2592000000).run();
+      return new Response(null, { status: 302, headers: { Location: "/admin", "Set-Cookie": `stream_pings_session=${id}.${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000` } });
     }
-    if (url.pathname === "/logout") return new Response(null, { status: 302, headers: { Location: "/login", "Set-Cookie": "stream_pings_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0" } });
+    if (url.pathname === "/logout") {
+      const token=cookie(request,"stream_pings_session")?.split(".")[1];
+      if(token)await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(await sha256(token)).run();
+      return new Response(null,{status:302,headers:{Location:"/login","Set-Cookie":"stream_pings_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"}});
+    }
     if (url.pathname === "/" || url.pathname === "/admin") return adminApp(request, env);
     if (!url.pathname.startsWith("/api/")) return new Response("Nie znaleziono", { status: 404 });
     const account = await getAccount(request, env);
@@ -262,8 +340,8 @@ export default {
           const videoId = extractVideoId(String(body.video_url ?? ""));
           if (!videoId) return json({ error: "Nie rozpoznano linku do filmu YouTube." }, 400);
           const meta = await fetchVideoMeta(videoId);
-          await env.DB.prepare("INSERT OR IGNORE INTO received_events(event_id) VALUES(?)").bind("yt:" + videoId).run();
           await discordYoutube(row, { id: videoId, title: meta.title, author: meta.author });
+          await env.DB.prepare("INSERT OR IGNORE INTO received_events(event_id) VALUES(?)").bind("yt:"+key+":"+videoId).run();
           return json({ ok: true });
         } catch (error) { return json({ error: error instanceof Error ? error.message : "Błąd" }, 400); }
       }
@@ -272,7 +350,7 @@ export default {
         const role = String(body.role_id ?? "").trim(), webhook = String(body.webhook_url ?? "").trim();
         const channelUrl = String(body.channel_url ?? "").trim();
         if (role && !/^\d{17,20}$/.test(role)) return json({ error: "ID roli powinno składać się z 17–20 cyfr." }, 400);
-        if (webhook && !/^https:\/\/((canary|ptb)\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/.+/.test(webhook)) return json({ error: "To nie wygląda na URL webhooka Discord." }, 400);
+        if (webhook && !validWebhook(webhook)) return json({ error: "To nie wygląda na URL webhooka Discord." }, 400);
         let channelId = row.channel_id, channelTitle = row.channel_title, lease = row.lease_expires;
         if (channelUrl && channelUrl !== row.channel_url) {
           try {
@@ -283,7 +361,7 @@ export default {
           } catch (error) { return json({ error: error instanceof Error ? error.message : "Błąd YouTube" }, 400); }
         }
         await env.DB.prepare("UPDATE youtube_channels SET enabled=?, role_id=?, message_text=?, webhook_url=?, color=?, channel_url=?, channel_id=?, channel_title=?, lease_expires=?, updated_at=CURRENT_TIMESTAMP WHERE account_key=?")
-          .bind(body.enabled ? 1 : 0, role, String(body.message_text ?? "").slice(0, 2000), webhook || row.webhook_url, Number(body.color) || 10181046, channelUrl || row.channel_url, channelId, channelTitle, lease, key).run();
+          .bind(body.enabled ? 1 : 0, role, String(body.message_text ?? "").slice(0, 2000), webhook || row.webhook_url, validColor(body.color), channelUrl || row.channel_url, channelId, channelTitle, lease, key).run();
         return json({ ok: true });
       }
     }
@@ -295,11 +373,16 @@ export default {
     if (!channel) return json({ error: "Nie znaleziono kanału" }, 404);
     if (match[2] === "/banner" && request.method === "POST") {
       const form = await request.formData(), file = form.get("banner");
-      if (!(file instanceof File) || !file.type.startsWith("image/") || file.size > 8 * 1024 * 1024) return json({ error: "Wgraj obraz do 8 MB." }, 400);
+      if (!(file instanceof File) || !["image/png","image/jpeg","image/webp"].includes(file.type) || file.size > 1900000) return json({ error: "Wgraj PNG, JPEG lub WebP do 1,9 MB." }, 400);
+      const bytes=await file.arrayBuffer(), b=new Uint8Array(bytes);
+      const png=b.length>=8 && [137,80,78,71,13,10,26,10].every((x,i)=>b[i]===x);
+      const jpg=b.length>=3 && b[0]===255 && b[1]===216 && b[2]===255;
+      const webp=b.length>=12 && String.fromCharCode(...b.slice(0,4))==="RIFF" && String.fromCharCode(...b.slice(8,12))==="WEBP";
+      if(!((file.type==="image/png"&&png)||(file.type==="image/jpeg"&&jpg)||(file.type==="image/webp"&&webp)))return json({error:"Nieprawidłowy format obrazu."},400);
       const key = `${login}-${crypto.randomUUID()}.${file.name.split(".").pop()?.toLowerCase() || "png"}`;
-      await env.DB.prepare("INSERT INTO banners(banner_key, content, content_type) VALUES (?, ?, ?)").bind(key, await file.arrayBuffer(), file.type).run();
-      if (channel.banner_key) await env.DB.prepare("DELETE FROM banners WHERE banner_key=?").bind(channel.banner_key).run();
-      await env.DB.prepare("UPDATE channels SET banner_key=?, updated_at=CURRENT_TIMESTAMP WHERE twitch_login=?").bind(key, login).run();
+      const statements=[env.DB.prepare("INSERT INTO banners(banner_key, content, content_type) VALUES (?, ?, ?)").bind(key,bytes,file.type),env.DB.prepare("UPDATE channels SET banner_key=?, updated_at=CURRENT_TIMESTAMP WHERE twitch_login=?").bind(key,login)];
+      if(channel.banner_key)statements.push(env.DB.prepare("DELETE FROM banners WHERE banner_key=?").bind(channel.banner_key));
+      await env.DB.batch(statements);
       return json({ ok: true, banner_key: key });
     }
     if (match[2] === "/test" && request.method === "POST") {
@@ -309,41 +392,55 @@ export default {
       const body = await request.json() as Partial<Channel>;
       const role = String(body.role_id ?? "").trim(), webhook = String(body.webhook_url ?? "").trim();
       if (role && !/^\d{17,20}$/.test(role)) return json({ error: "ID roli powinno składać się z 17–20 cyfr." }, 400);
-      if (webhook && !/^https:\/\/((canary|ptb)\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/.+/.test(webhook)) return json({ error: "To nie wygląda na URL webhooka Discord." }, 400);
-      await env.DB.prepare("UPDATE channels SET enabled=?, role_id=?, message_text=?, display_name=?, webhook_url=?, color=?, updated_at=CURRENT_TIMESTAMP WHERE twitch_login=?").bind(body.enabled ? 1 : 0, role, String(body.message_text ?? "").slice(0, 2000), String(body.display_name ?? "").slice(0, 100), webhook || channel.webhook_url, Number(body.color) || 10181046, login).run();
+      if (webhook && !validWebhook(webhook)) return json({ error: "To nie wygląda na URL webhooka Discord." }, 400);
+      await env.DB.prepare("UPDATE channels SET enabled=?, role_id=?, message_text=?, display_name=?, webhook_url=?, color=?, updated_at=CURRENT_TIMESTAMP WHERE twitch_login=?").bind(body.enabled ? 1 : 0, role, String(body.message_text ?? "").slice(0, 2000), String(body.display_name ?? "").slice(0, 100), webhook || channel.webhook_url, validColor(body.color), login).run();
       return json({ ok: true });
     }
     return json({ error: "Nieobsługiwana operacja" }, 405);
   },
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    await ready(env);
+    const now=Date.now();
+    const jobs=(await env.DB.prepare("SELECT event_key FROM delivery_queue WHERE status IN ('pending','sending') AND next_at<=? ORDER BY next_at LIMIT 10").bind(now).all<{event_key:string}>()).results;
+    for(const job of jobs)await deliver(env,job.event_key);
+    if(event.cron!=="0 6 * * *")return;
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM sessions WHERE expires_at<=?").bind(now),
+      env.DB.prepare("DELETE FROM login_limits WHERE window<?").bind(Math.floor(now/900000)-4),
+      env.DB.prepare("DELETE FROM delivery_queue WHERE status='delivered' AND updated_at<?").bind(now-30*86400000),
+      env.DB.prepare("DELETE FROM received_events WHERE received_at<datetime('now','-30 days')")
+    ]);
     const soon = new Date(Date.now() + 2 * 24 * 3600 * 1000).toISOString();
     const rows = (await env.DB.prepare("SELECT account_key, channel_id FROM youtube_channels WHERE enabled=1 AND channel_id <> '' AND (lease_expires IS NULL OR lease_expires < ?)").bind(soon).all<{ account_key: string; channel_id: string }>()).results;
     for (const row of rows) {
       ctx.waitUntil((async () => {
         try {
-          await subscribeYoutube(row.channel_id, `https://pssp.viriacci.workers.dev/youtube-callback/${row.account_key}`, env);
+          await subscribeYoutube(row.channel_id, `${env.PUBLIC_ORIGIN || "https://pssp.viriacci.workers.dev"}/youtube-callback/${row.account_key}`, env);
           await env.DB.prepare("UPDATE youtube_channels SET lease_expires=? WHERE account_key=?").bind(new Date(Date.now() + 432000 * 1000).toISOString(), row.account_key).run();
-        } catch { /* spróbujemy ponownie przy następnym uruchomieniu harmonogramu */ }
+        } catch(e) { console.error("YouTube renewal failed",row.account_key,e instanceof Error?e.message:"error"); }
       })());
     }
   }
 } satisfies ExportedHandler<Env>;
 
-async function handleEventSub(request: Request, env: Env) {
+async function handleEventSub(request: Request, env: Env, ctx: ExecutionContext) {
   const raw = await request.text();
   const id = request.headers.get("Twitch-Eventsub-Message-Id") ?? "";
   const timestamp = request.headers.get("Twitch-Eventsub-Message-Timestamp") ?? "";
   const signature = request.headers.get("Twitch-Eventsub-Message-Signature") ?? "";
+  if(!env.TWITCH_EVENTSUB_SECRET || !id || !Number.isFinite(Date.parse(timestamp)) || Math.abs(Date.now()-Date.parse(timestamp))>600000)return new Response("Invalid timestamp", {status:403});
   if (!same(signature, "sha256=" + await hmacHex(env.TWITCH_EVENTSUB_SECRET, id + timestamp + raw))) return new Response("Nieprawidłowy podpis", { status: 403 });
   const type = request.headers.get("Twitch-Eventsub-Message-Type");
   const body = JSON.parse(raw);
   if (type === "webhook_callback_verification") return new Response(body.challenge, { headers: { "content-type": "text/plain" } });
   if (type !== "notification" || body.subscription?.type !== "stream.online") return new Response("OK");
-  const seen = await env.DB.prepare("INSERT OR IGNORE INTO received_events(event_id) VALUES(?)").bind(id).run();
-  if (!seen.meta.changes) return new Response("OK");
   const login = String(body.event?.broadcaster_user_login ?? "").toLowerCase();
-  const channel = await env.DB.prepare("SELECT * FROM channels WHERE twitch_login=? AND enabled=1").bind(login).first<Channel>();
-  if (channel) await discord(channel, new URL(request.url).origin, await twitchStream(login, env));
+  if(!/^[a-z0-9_]+$/.test(login))return new Response("Invalid event",{status:400});
+  const previous=await env.DB.prepare("SELECT event_id FROM received_events WHERE event_id=?").bind(id).first();
+  if(previous)return new Response("OK");
+  const key="tw:"+login+":"+String(body.event?.id || id);
+  await enqueue(env,key,"twitch",login,{},new URL(request.url).origin);
+  ctx.waitUntil(deliver(env,key));
   return new Response("OK");
 }
 
@@ -353,9 +450,10 @@ async function handleYoutubeVerify(request: Request) {
   if (!challenge) return new Response("Brak challenge", { status: 400 });
   return new Response(challenge, { headers: { "content-type": "text/plain" } });
 }
-async function handleYoutubeNotification(request: Request, env: Env, key: string) {
+async function handleYoutubeNotification(request: Request, env: Env, key: string, ctx: ExecutionContext) {
   const raw = await request.arrayBuffer();
   const signatureHeader = request.headers.get("X-Hub-Signature") ?? "";
+  if(!env.YOUTUBE_WEBSUB_SECRET)return new Response("Missing secret",{status:503});
   const expected = "sha1=" + await hmacSha1Hex(env.YOUTUBE_WEBSUB_SECRET, raw);
   if (!same(signatureHeader, expected)) return new Response("Nieprawidłowy podpis", { status: 403 });
   const xml = new TextDecoder().decode(raw);
@@ -363,10 +461,14 @@ async function handleYoutubeNotification(request: Request, env: Env, key: string
   const title = xml.match(/<title>([^<]*)<\/title>/g)?.[1]?.replace(/<\/?title>/g, "");
   const author = xml.match(/<author>\s*<name>([^<]*)<\/name>/)?.[1];
   if (!videoId) return new Response("OK");
-  const seen = await env.DB.prepare("INSERT OR IGNORE INTO received_events(event_id) VALUES(?)").bind("yt:" + videoId).run();
-  if (!seen.meta.changes) return new Response("OK");
   const row = await env.DB.prepare("SELECT * FROM youtube_channels WHERE account_key=? AND enabled=1").bind(key).first<YoutubeChannel>();
-  if (row) await discordYoutube(row, { id: videoId, title: title ?? "Nowy film", author: author ?? row.channel_title });
+  const channelId=xml.match(/<yt:channelId>([^<]+)<\/yt:channelId>/)?.[1];
+  if(!row || !/^[A-Za-z0-9_-]{11}$/.test(videoId) || channelId!==row.channel_id)return new Response("OK");
+  const eventKey="yt:"+key+":"+videoId;
+  const previous=await env.DB.prepare("SELECT event_id FROM received_events WHERE event_id IN (?,?)").bind(eventKey,"yt:"+videoId).first();
+  if(previous)return new Response("OK");
+  await enqueue(env,eventKey,"youtube",key,{id:videoId,title:title??"Nowy film",author:author??row.channel_title},new URL(request.url).origin);
+  ctx.waitUntil(deliver(env,eventKey));
   return new Response("OK");
 }
 
